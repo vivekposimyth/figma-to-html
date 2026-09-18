@@ -37,7 +37,7 @@ function score(result) {
     n(f.overflow) * 25 + n(f.fontsNotLoaded) * 20 +
     n(f.declaredInteractions) * 15 + n(f.interactions) * 15 + n(f.missingComponents) * 25 +
     n(f.geometry) * 6 + n(f.deadControls) * 3 + n(f.clippedElements) * 20 + n(f.visualFindings) * 10 +
-    n(f.responsive) * 22 +
+    n(f.responsive) * 22 + n(f.lostFlow) * 18 + n(f.notFullBleed) * 18 +
     Math.round((result.stats.visualDiffPct || 0) * 2)
   );
 }
@@ -114,23 +114,29 @@ async function main() {
     return r;
   };
 
-  const canResume =
-    args.includes("--resume") &&
-    REQUIRED_FILES.every((f) => fs.existsSync(path.join(outDir, f)));
-  if (canResume) {
-    files = Object.fromEntries(
-      REQUIRED_FILES.map((f) => [f, fs.readFileSync(path.join(outDir, f), "utf8")])
-    );
-    log(`--resume: reusing existing files in output/${pageName}/, skipping generation`);
-  } else {
-    if (args.includes("--resume")) log("--resume requested but no previous files found — generating fresh");
-    // One file per call: a big page's three files rarely fit in a single completion.
+    // Resume from whatever survived. A run that died on style.css still has a
+    // perfectly good index.html and script.js; demanding all three meant
+    // regenerating work that was already paid for.
+    const resuming = args.includes("--resume");
     files = {};
+    if (resuming) {
+      for (const f of GENERATED_FILES) {
+        const p = path.join(outDir, f);
+        if (fs.existsSync(p) && fs.statSync(p).size > 40) files[f] = fs.readFileSync(p, "utf8");
+      }
+      const have = Object.keys(files);
+      log(have.length
+        ? `--resume: keeping ${have.join(", ")}; regenerating the rest`
+        : `--resume: nothing usable on disk, generating fresh`);
+    }
+
+    // One file per call: a big page's three files rarely fit in a single completion.
     const ctx = designContext({
       designJson, variables, manifest, stage: design.stage, pageName,
       anchors: design.anchors, fonts: design.fonts, components: design.components,
     });
     const generate = async (target) => {
+      if (files[target]) { log(`reusing existing ${target}`); return; }
       const prompt = filePrompt({ target, ctx, files });
       const images = target === "index.html"
         ? [figmaShot, ...sections.map((s) => s.file)].filter(Boolean)
@@ -165,7 +171,6 @@ async function main() {
     await generate("index.html");
     await Promise.all([generate("style.css"), generate("script.js")]);
     await generate("interactions.json");
-  }
 
   // ---------- 4. validate + fix loop ----------
   // Coded checks find what we thought to look for; the inspector looks at the
@@ -196,7 +201,7 @@ async function main() {
     log(`fix round ${round} ...`);
     fs.writeFileSync(path.join(refsDir, `validation-round${round - 1}.json`), JSON.stringify(result.failures, null, 1));
     try {
-      res = await timedChat({ ...cfg, maxTokens: cfg.fixMaxTokens }, {
+      res = await timedChat({ ...cfg, maxTokens: cfg.fixMaxTokens, noBudgetRetry: true }, {
         system,
         userContent: withImages(
           cfg,
@@ -222,7 +227,7 @@ async function main() {
     if (!patches.length && !Object.keys(parseFiles(res.text)).length) {
       log(`  no patches and no complete file in the reply — asking once more`);
       try {
-        res = await timedChat({ ...cfg, maxTokens: cfg.fixMaxTokens }, {
+        res = await timedChat({ ...cfg, maxTokens: cfg.fixMaxTokens, noBudgetRetry: true }, {
           system,
           userContent:
             fixPrompt({ validation: result.failures, files, round, failedPatches, hasCrops: false }) +
