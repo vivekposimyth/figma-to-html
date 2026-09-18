@@ -1,0 +1,16 @@
+{
+  "name": "figma-to-code-pipeline",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Automated Figma -> HTML/CSS/JS conversion with LLM generation (OpenRouter) and Playwright validation loop",
+  "scripts": {
+    "convert": "node convert.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "playwright": "^1.63.0"
+  }
+}
