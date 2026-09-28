@@ -20,7 +20,7 @@ import {
 } from "./lib/llm.js";
 import { validate } from "./lib/validate.js";
 import { createCostTracker } from "./lib/cost.js";
-import { inspectVisually } from "./lib/inspect.js";
+import { inspectVisually, triageFailures, applyTriage } from "./lib/inspect.js";
 
 const log = (msg) => console.log(`\x1b[36m[pipeline]\x1b[0m ${msg}`);
 
@@ -109,7 +109,7 @@ async function main() {
     const r = await chat(c, opts);
     usage.prompt += r.usage?.prompt_tokens || 0;
     usage.completion += r.usage?.completion_tokens || 0;
-    const spent = await cost.add(label, r.usage);
+    const spent = await cost.add(label, r.usage, c.model);
     log(`${label} — done in ${Math.round((Date.now() - t0) / 1000)}s (${r.usage?.completion_tokens || "?"} tokens out${spent != null ? `, ${spent < 0.01 ? "$" + spent.toFixed(5) : "$" + spent.toFixed(4)}` : ""}, finish: ${r.finish})`);
     return r;
   };
@@ -134,6 +134,7 @@ async function main() {
     const ctx = designContext({
       designJson, variables, manifest, stage: design.stage, pageName,
       anchors: design.anchors, fonts: design.fonts, components: design.components,
+      contentWidths: design.contentWidths,
     });
     const generate = async (target) => {
       if (files[target]) { log(`reusing existing ${target}`); return; }
@@ -175,14 +176,49 @@ async function main() {
   // ---------- 4. validate + fix loop ----------
   // Coded checks find what we thought to look for; the inspector looks at the
   // design next to the render and reports what we did not.
+  // The coded checks are hypotheses. Before anything scores them or patches
+  // against them, let the model look at the page and drop the ones that are an
+  // artefact of a rule rather than a defect a person would see.
+  // Everything after generation runs on this config: the fix rounds, the visual
+  // inspector and the triage pass. They are a different job from writing a page
+  // — short, judgement-shaped replies against evidence that is already gathered
+  // — and they suffer most from a model whose reasoning trace cannot be capped,
+  // because their budgets are small enough for the trace to eat whole. Naming it
+  // once also keeps withImages on the same object, so a fix model without vision
+  // is never handed screenshots.
+  const fixCfg = {
+    ...cfg,
+    model: cfg.fixModel,
+    vision: cfg.fixVision,
+    maxTokens: cfg.fixMaxTokens,
+    reasoning: cfg.fixReasoning,
+    noBudgetRetry: true,
+  };
+
+  const triageRound = async (r, round) => {
+    if (!fixCfg.vision) return;
+    const t = await triageFailures(fixCfg, {
+      failures: r.failures, figmaShot,
+      renderShot: r.screenshotPath, mobileShot: r.mobileShotPath,
+    });
+    if (!t) return;
+    if (t.usage) await cost.add(`triage round ${round}`, t.usage, fixCfg.model);
+    if (t.error) { log(`  triage failed: ${t.error} — keeping every failure`); return; }
+    if (!t.rejected.length) return;
+    log(`  triage: ${t.rejected.length}/${t.considered} reported failure(s) judged not real`);
+    t.rejected.slice(0, 4).forEach((x) => log(`    - ${x.id}: ${x.why}`));
+    fs.writeFileSync(path.join(refsDir, `triage-round${round}.json`), JSON.stringify(t.rejected, null, 1));
+    applyTriage(r, t.rejected);
+  };
+
   const inspectRound = async (r, round) => {
-    if (!cfg.vision) return;
-    const seen = await inspectVisually(cfg, {
+    if (!fixCfg.vision) return;
+    const seen = await inspectVisually(fixCfg, {
       crops: r.comparisonShots, figmaShot, renderShot: r.screenshotPath,
       mobileShot: r.mobileShotPath,
     });
     if (!seen) return;
-    await cost.add(`inspect round ${round}`, seen.usage);
+    await cost.add(`inspect round ${round}`, seen.usage, fixCfg.model);
     if (seen.error) { log(`  inspector failed: ${seen.error}`); return; }
     const notable = seen.findings.filter((f) => f.severity !== "low");
     log(`  inspector: ${seen.findings.length} finding(s)${notable.length ? ` (${notable.length} notable)` : ""}`);
@@ -192,6 +228,7 @@ async function main() {
   };
 
   let result = await validate(cfg, { outDir, design, refsDir, round: 0, figmaShotPath: figmaShot });
+  await triageRound(result, 0);
   await inspectRound(result, 0);
   log(`round 0 (generate): ${result.pass ? "PASS" : "fail — " + Object.keys(result.failures).join(", ")} (max geometry delta ${result.stats.maxDelta}px over ${result.stats.measured} anchors)`);
 
@@ -201,12 +238,20 @@ async function main() {
     log(`fix round ${round} ...`);
     fs.writeFileSync(path.join(refsDir, `validation-round${round - 1}.json`), JSON.stringify(result.failures, null, 1));
     try {
-      res = await timedChat({ ...cfg, maxTokens: cfg.fixMaxTokens, noBudgetRetry: true }, {
+      // Fix rounds get their own budget AND their own reasoning setting. The
+      // budget had to be huge (40,000 produced 0 patches, 60,000 produced 39)
+      // only because reasoning was on and deepseek-v4.1-flash cannot be told to
+      // reason less — every documented control is ignored except turning it off
+      // (see lib/llm.js). With FIX_REASONING=off the trace is gone, so the whole
+      // budget goes to patches and the round finishes in a fraction of the time.
+      res = await timedChat(fixCfg, {
         system,
         userContent: withImages(
-          cfg,
+          fixCfg,
           fixPrompt({ validation: result.failures, files, round, failedPatches,
-                      hasCrops: (result.comparisonShots || []).length > 0 }),
+                      // only claim attached crops when they will actually be sent —
+                      // withImages drops them when the fix model has no vision
+                      hasCrops: fixCfg.vision && (result.comparisonShots || []).length > 0 }),
           // side-by-side crops of the worst regions beat a downscaled full-page
           // shot; fall back to the whole page when nothing differed enough
           (result.comparisonShots || []).length
@@ -227,7 +272,7 @@ async function main() {
     if (!patches.length && !Object.keys(parseFiles(res.text)).length) {
       log(`  no patches and no complete file in the reply — asking once more`);
       try {
-        res = await timedChat({ ...cfg, maxTokens: cfg.fixMaxTokens, noBudgetRetry: true }, {
+        res = await timedChat(fixCfg, {
           system,
           userContent:
             fixPrompt({ validation: result.failures, files, round, failedPatches, hasCrops: false }) +
@@ -236,6 +281,13 @@ async function main() {
         patches = parsePatches(res.text);
       } catch (e) { log(`  reformat attempt failed: ${e.message}`); }
     }
+    // Snapshot BEFORE the patches touch anything. Capturing it after meant
+    // "previous.files" was the patched files, so a rollback restored the very
+    // version it was rolling back from — a no-op that still reset `result` to
+    // the older one, leaving the score and the files on disk describing
+    // different code for every round that followed.
+    const previous = { result, files: { ...files } };
+
     const changed = new Set();
     if (patches.length) {
       const { files: patched, applied, failed } = applyPatches(files, patches);
@@ -260,35 +312,44 @@ async function main() {
     }
     for (const f of changed) fs.writeFileSync(path.join(outDir, f), files[f]);
     log(`fix round ${round} updated: ${[...changed].join(", ")}`);
-    const previous = { result, files: { ...files } };
     result = await validate(cfg, {
       outDir, design, refsDir, round, figmaShotPath: figmaShot,
       changed, previous: previous.result,
     });
+    await triageRound(result, round);
     // the inspector only earns its call when the picture actually moved
     const visualMoved =
       Math.abs((result.stats.visualDiffPct || 0) - (previous.result.stats.visualDiffPct || 0)) > 0.5;
     if (visualMoved || round === 1) await inspectRound(result, round);
     else if (previous.result.failures.visualFindings)
       result.failures.visualFindings = previous.result.failures.visualFindings;
+    const was = score(previous.result), now = score(result);
+    const gain = was - now;                        // positive = this round helped
     log(`round ${round}: ${result.pass ? "PASS" : "fail — " + Object.keys(result.failures).join(", ")} ` +
-        `(score ${score(result)}, was ${score(previous.result)}; max delta ${result.stats.maxDelta}px)`);
+        `(score ${now}, was ${was}${gain ? `, ${gain > 0 ? "-" : "+"}${Math.abs(gain)}` : ", no change"}; max delta ${result.stats.maxDelta}px)`);
 
     // A fix can fix one thing and break two. Never let the run end on a state
     // that is worse than one it already reached.
-    if (!result.pass && score(result) > score(previous.result)) {
+    if (!result.pass && now > was) {
       log(`  regression — round ${round} is worse than round ${round - 1}; rolling back`);
       files = previous.files;
       for (const f of GENERATED_FILES) if (files[f]) fs.writeFileSync(path.join(outDir, f), files[f]);
       result = previous.result;
       failedPatches = [];
       stalled++;
-    } else if (score(result) === score(previous.result)) {
+    } else if (gain < Math.max(3, was * 0.05)) {
+      // Barely moving is not progress. Testing for exact equality was too
+      // strict: a round that shaved one point off reset the counter and bought
+      // another full round for nothing. Some failures cannot be patched away at
+      // all — a child sitting correctly inside a mispositioned container has no
+      // property of its own to change — so the run must notice and stop rather
+      // than keep paying for rounds that only nibble.
       stalled++;
+      log(`  only ${gain} point${gain === 1 ? "" : "s"} better — not real progress (${stalled}/2)`);
     } else stalled = 0;
 
     if (stalled >= 2) {
-      log(`  no progress for 2 rounds — stopping instead of burning more calls`);
+      log(`  two rounds without real progress — stopping; the rest needs a person, not another round`);
       break;
     }
   }
